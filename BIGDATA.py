@@ -1,0 +1,240 @@
+import requests
+import gzip
+import json
+import os
+import sys
+import pandas as pd
+from datetime import datetime, timedelta
+import locale
+from collections import Counter
+
+# ============================================================
+# CONFIGURACIÓN GENERAL
+# ============================================================
+
+HORAS = range(15,17)
+SAMPLE_SIZE = 208
+
+
+# ============================================================
+# FUNCIONES AUXILIARES
+# ============================================================
+
+def safe_eval(x):
+    if isinstance(x, dict):
+        return x
+    try:
+        return eval(x)
+    except Exception:
+        return {}
+
+def contar_commits(payload):
+    payload_dict = safe_eval(payload)
+    if isinstance(payload_dict, dict) and 'commits' in payload_dict:
+        return len(payload_dict['commits'])
+    return 0
+
+def extraer_detalles(payload, tipo):
+    payload_dict = safe_eval(payload)
+    detalles = {}
+    if tipo == "PushEvent":
+        detalles["branch"] = payload_dict.get("ref", "").split("/")[-1]
+        detalles["tamano_push"] = payload_dict.get("size", 0)
+    elif tipo in ["PullRequestEvent", "IssuesEvent"]:
+        detalles["action"] = payload_dict.get("action")
+    return detalles
+
+
+try:
+    locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
+except:
+    locale.setlocale(locale.LC_TIME, 'es_ES')
+
+
+# ============================================================
+# FUNCIÓN PRINCIPAL PARA PROCESAR UN DÍA
+# ============================================================
+
+def procesar_dia(fecha_input):
+
+    fecha = datetime.strptime(fecha_input, "%Y-%m-%d")
+    fecha_str = fecha.strftime("%Y-%m-%d")
+    dia_nombre = fecha.strftime("%A").capitalize()
+
+    print(f"\n📅 Procesando {fecha_str}...\n")
+
+
+    dfs_horas = []
+    archivos_ok = 0
+
+    # ---------------------------------------------------------
+    # DESCARGAR Y PROCESAR LAS 24 HORAS
+    # ---------------------------------------------------------
+    for hora in HORAS:
+        url = f"https://data.gharchive.org/{fecha_str}-{hora:02d}.json.gz"
+        file_path = f"{fecha_str}-{hora:02d}.json.gz"
+
+        # Descargar si no existe
+        if not os.path.exists(file_path):
+            try:
+                r = requests.get(url, stream=True, timeout=60)
+                if r.status_code == 200:
+                    with open(file_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                else:
+                    print(f"⚠️ {url} no disponible ({r.status_code})")
+                    continue
+            except Exception as e:
+                print(f"❌ Error descargando {url}: {e}")
+                continue
+
+        # Leer archivo
+        try:
+            with gzip.open(file_path, 'rt', encoding='utf-8') as f:
+                data = [json.loads(line) for line in f]
+
+            if len(data) > 0:
+                df = pd.DataFrame(data)
+                dfs_horas.append(df)
+                archivos_ok += 1
+        except Exception as e:
+            print(f"⚠️ Error leyendo {file_path}: {e}")
+            continue
+
+    # ---------------------------------------------------------
+    # SI NO HAY DATOS
+    # ---------------------------------------------------------
+    if len(dfs_horas) == 0:
+        print(f"⚪ Sin datos para {fecha_str}")
+        return
+
+    df_dia = pd.concat(dfs_horas, ignore_index=True)
+    print(f"✅ {fecha_str}: {len(df_dia)} registros ({archivos_ok} archivos válidos)\n")
+
+    # ---------------------------------------------------------
+    # PROCESAMIENTO
+    # ---------------------------------------------------------
+    df_dia = df_dia[['type', 'actor', 'repo', 'payload', 'created_at']]
+
+    df_dia['actor_login'] = df_dia['actor'].apply(lambda x: safe_eval(x).get('login'))
+    df_dia['actor_id'] = df_dia['actor'].apply(lambda x: safe_eval(x).get('id'))
+    df_dia['repo_name'] = df_dia['repo'].apply(lambda x: safe_eval(x).get('name'))
+    df_dia['repo_id'] = df_dia['repo'].apply(lambda x: safe_eval(x).get('id'))
+
+    detalles = df_dia.apply(lambda x: extraer_detalles(x['payload'], x['type']), axis=1)
+    df_dia['branch'] = detalles.apply(lambda x: x.get("branch"))
+    df_dia['tamano_push'] = detalles.apply(lambda x: x.get("tamano_push"))
+    df_dia['action'] = detalles.apply(lambda x: x.get("action"))
+    df_dia['n_commits'] = df_dia.apply(
+        lambda x: contar_commits(x['payload']) if x['type'] == 'PushEvent' else 0,
+        axis=1
+    )
+
+    df_filtrado = df_dia[['created_at', 'type', 'actor_login', 'actor_id',
+                          'repo_name', 'repo_id', 'branch',
+                          'tamano_push', 'action', 'n_commits']]
+
+    # ---------------------------------------------------------
+    # JSON: Información del día
+    # ---------------------------------------------------------
+    doc_dia = {
+        "fecha": fecha_str,
+        "dia": dia_nombre,
+        "cantidad_archivos": archivos_ok,
+        "cantidad_regs": len(df_filtrado),
+        "tipos_eventos": sorted(df_filtrado['type'].unique().tolist())
+    }
+
+    # ---------------------------------------------------------
+    # JSON: Muestra
+    # ---------------------------------------------------------
+    df_sample = df_filtrado.sample(SAMPLE_SIZE, random_state=42) \
+        if len(df_filtrado) > SAMPLE_SIZE else df_filtrado
+
+    doc_muestra = {
+        "fecha": fecha_str,
+        "dia": dia_nombre,
+        "registros_muestra": df_sample.to_dict("records")
+    }
+
+    # Guardar salidas
+    with open("gh_dias.json", "w", encoding="utf-8") as f:
+        json.dump(doc_dia, f, ensure_ascii=False, indent=4)
+
+    with open("gh_muestras.json", "w", encoding="utf-8") as f:
+        json.dump(doc_muestra, f, ensure_ascii=False, indent=4)
+
+    print("💾 Guardado: gh_dias.json y gh_muestras.json\n")
+
+    return fecha_str
+
+
+
+# ============================================================
+# CÁLCULO DE MÉTRICAS
+# ============================================================
+
+def procesar_metricas():
+    with open("gh_dias.json", "r", encoding="utf-8") as f:
+        gh_dias = json.load(f)
+
+    with open("gh_muestras.json", "r", encoding="utf-8") as f:
+        gh_muestras = json.load(f)
+
+    # Solo procesamos una fecha
+    info_dia = gh_dias
+    fecha = info_dia["fecha"]
+    dia_nombre = info_dia["dia"]
+
+    # Expandir muestra
+    registros = []
+    for fila in gh_muestras["registros_muestra"]:
+        registros.append(fila)
+
+    df = pd.DataFrame(registros)
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+
+    # Tipo más recurrente
+    recurrente = df["type"].value_counts().idxmax() if len(df) else None
+
+    # Actor recurrente
+    actor_recurrente = df["actor_login"].value_counts().idxmax() if len(df) else None
+
+    # Horas sin actividad
+    horas_presentes = df["created_at"].dt.hour.unique().tolist()
+    horas_sin = sorted(set(range(24)) - set(horas_presentes))
+
+    # Construcción del JSON final
+    salida = {
+        "fecha": fecha,
+        "dia": dia_nombre,
+        "accion_mas_recurrente": recurrente,
+        "horas_inactivas": horas_sin,
+        "actor_mas_recurrente": actor_recurrente
+    }
+
+    # Guardar archivo
+    with open("metrics.json", "w", encoding="utf-8") as f:
+        json.dump(salida, f, ensure_ascii=False, indent=4)
+
+    print("📊 metrics.json generado correctamente.\n")
+
+
+
+
+# ============================================================
+# EJECUCIÓN POR INPUT
+# ============================================================
+
+if __name__ == "__main__":
+
+    if len(sys.argv) < 2:
+        print("\n❌ Debes ingresar una fecha. Ejemplo:\n")
+        print("   python BIGDATA.py 2025-01-02\n")
+        sys.exit()
+
+    fecha_input = sys.argv[1]
+
+    procesar_dia(fecha_input)
+    procesar_metricas()
