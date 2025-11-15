@@ -11,8 +11,8 @@ import locale
 # CONFIGURACIÓN GENERAL
 # ============================================================
 
-HORAS = range(15, 17)
-SAMPLE_SIZE = 208
+HORAS = range(15,17)
+SAMPLE_SIZE = 209
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -60,11 +60,11 @@ def procesar_dia(fecha_input):
     print(f"\n📅 Procesando {fecha_str}...\n")
 
     dfs_horas = []
+    muestras_total = []   # <--- NUEVO: acumulador de muestras por hora
     archivos_ok = 0
 
-    # Descarga y lectura
     for hora in HORAS:
-        url = f"https://data.gharchive.org/{fecha_str}-{hora:02d}.json.gz"
+        url = f"https://data.gharchive.org/{fecha_str}-{hora:01d}.json.gz"
         file_path = f"{fecha_str}-{hora:02d}.json.gz"
 
         if not os.path.exists(file_path):
@@ -87,8 +87,48 @@ def procesar_dia(fecha_input):
 
             if len(data) > 0:
                 df = pd.DataFrame(data)
+
+                # ----------------------------------------------------------
+                # PROCESAMIENTO POR HORA (MISMAS COLUMNAS FINALES)
+                # ----------------------------------------------------------
+                df_m = df[['type', 'actor', 'repo', 'payload', 'created_at']].copy()
+
+                df_m['actor_login'] = df_m['actor'].apply(lambda x: safe_eval(x).get('login'))
+                df_m['actor_id'] = df_m['actor'].apply(lambda x: safe_eval(x).get('id'))
+                df_m['repo_name'] = df_m['repo'].apply(lambda x: safe_eval(x).get('name'))
+                df_m['repo_id'] = df_m['repo'].apply(lambda x: safe_eval(x).get('id'))
+
+                detalles = df_m.apply(lambda x: extraer_detalles(x['payload'], x['type']), axis=1)
+                df_m['branch'] = detalles.apply(lambda x: x.get("branch"))
+                df_m['tamano_push'] = detalles.apply(lambda x: x.get("tamano_push"))
+                df_m['action'] = detalles.apply(lambda x: x.get("action"))
+                df_m['n_commits'] = df_m.apply(
+                    lambda x: contar_commits(x['payload']) if x['type'] == 'PushEvent' else 0,
+                    axis=1
+                )
+
+                # === SOLO LAS COLUMNAS QUE VAN A gh_muestras.json ===
+                df_hora = df_m[
+                    ['created_at', 'type', 'actor_login', 'actor_id',
+                    'repo_name', 'repo_id', 'branch', 'tamano_push',
+                    'action', 'n_commits']
+                ].copy()
+
+                # MUESTRA DE 209 POR HORA
+                df_sample = df_hora.sample(SAMPLE_SIZE, random_state=42) \
+                    if len(df_hora) > SAMPLE_SIZE else df_hora
+
+                df_sample["fecha"] = fecha_str
+                df_sample["dia"] = dia_nombre
+                df_sample["hora"] = hora   # <--- mantiene la hora original numérica
+
+                muestras_total.extend(df_sample.to_dict("records"))
+
+
+                # ----------------------------------
                 dfs_horas.append(df)
                 archivos_ok += 1
+
         except Exception as e:
             print(f"⚠️ Error leyendo {file_path}: {e}")
             continue
@@ -98,7 +138,10 @@ def procesar_dia(fecha_input):
         return
 
     df_dia = pd.concat(dfs_horas, ignore_index=True)
-    print(f"✅ {fecha_str}: {len(df_dia)} registros ({archivos_ok} archivos válidos)\n")
+
+    print(f"✅ {fecha_str}: {len(df_dia)} registros ({archivos_ok} archivos válidos)")
+    print(f"📌 Total muestras generadas: {len(muestras_total)}\n")
+
 
     # ---------------------------------------------------------
     # PROCESAMIENTO
@@ -133,6 +176,7 @@ def procesar_dia(fecha_input):
         "dia": dia_nombre,
         "cantidad_archivos": archivos_ok,
         "cantidad_regs": len(df_filtrado),
+        "cantidad_regs_sample": len(muestras_total),   # <--- NUEVO
         "tipos_eventos": sorted(df_filtrado['type'].unique().tolist())
     }
 
@@ -140,26 +184,34 @@ def procesar_dia(fecha_input):
         json.dump(doc_dia, f, ensure_ascii=False, indent=4)
 
     # ---------------------------------------------------------
-    # SALIDA: gh_muestras.json (LISTA DIRECTA)
+    # SALIDA FINAL: gh_muestras.json (209 por cada hora)
     # ---------------------------------------------------------
 
-    df_sample = df_filtrado.sample(SAMPLE_SIZE, random_state=42) \
-        if len(df_filtrado) > SAMPLE_SIZE else df_filtrado
+    muestras_df = pd.DataFrame(muestras_total)
 
-    df_sample = df_sample.copy()
-    df_sample["fecha"] = fecha_str
-    df_sample["dia"] = dia_nombre
-    df_sample["hora"] = pd.to_datetime(df_sample["created_at"], errors="coerce").dt.strftime("%H:%M:%S")
+    # convertir hora a formato HH:MM:SS
+    muestras_df["created_at"] = pd.to_datetime(muestras_df["created_at"], errors="coerce")
+    muestras_df["hora"] = muestras_df["created_at"].dt.strftime("%H:%M:%S")
 
-    columnas = ["fecha", "dia", "hora"] + [c for c in df_sample.columns if c not in ["fecha", "dia", "hora"]]
-    df_sample = df_sample[columnas]
+    columnas = ["fecha", "dia", "hora"] + [
+        c for c in muestras_df.columns if c not in ["fecha", "dia", "hora"]
+    ]
+    muestras_df = muestras_df[columnas]
 
-    muestras_lista = df_sample.to_dict("records")
+
+    # Asegurar que created_at sea string
+    muestras_df["created_at"] = muestras_df["created_at"].astype(str)
+
+    # Asegurar que no quede ningún Timestamp en ninguna columna
+    for col in muestras_df.columns:
+        muestras_df[col] = muestras_df[col].apply(lambda x: x.isoformat() if hasattr(x, "isoformat") else x)
 
     with open("gh_muestras.json", "w", encoding="utf-8") as f:
-        json.dump(muestras_lista, f, ensure_ascii=False, indent=4)
+        json.dump(muestras_df.to_dict("records"), f, ensure_ascii=False, indent=4)
 
-    print("💾 Guardado: gh_dias.json y gh_muestras.json\n")
+
+    print(f"💾 Guardado: gh_dias.json y gh_muestras.json ({len(muestras_df)} muestras totales)\n")
+
 
     return fecha_str
 
