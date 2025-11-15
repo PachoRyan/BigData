@@ -6,15 +6,13 @@ import sys
 import pandas as pd
 from datetime import datetime, timedelta
 import locale
-from collections import Counter
 
 # ============================================================
 # CONFIGURACIÓN GENERAL
 # ============================================================
 
-HORAS = range(15,17)
+HORAS = range(15, 17)
 SAMPLE_SIZE = 208
-
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -44,12 +42,10 @@ def extraer_detalles(payload, tipo):
         detalles["action"] = payload_dict.get("action")
     return detalles
 
-
 try:
     locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')
 except:
     locale.setlocale(locale.LC_TIME, 'es_ES')
-
 
 # ============================================================
 # FUNCIÓN PRINCIPAL PARA PROCESAR UN DÍA
@@ -63,18 +59,14 @@ def procesar_dia(fecha_input):
 
     print(f"\n📅 Procesando {fecha_str}...\n")
 
-
     dfs_horas = []
     archivos_ok = 0
 
-    # ---------------------------------------------------------
-    # DESCARGAR Y PROCESAR LAS 24 HORAS
-    # ---------------------------------------------------------
+    # Descarga y lectura
     for hora in HORAS:
         url = f"https://data.gharchive.org/{fecha_str}-{hora:02d}.json.gz"
         file_path = f"{fecha_str}-{hora:02d}.json.gz"
 
-        # Descargar si no existe
         if not os.path.exists(file_path):
             try:
                 r = requests.get(url, stream=True, timeout=60)
@@ -89,7 +81,6 @@ def procesar_dia(fecha_input):
                 print(f"❌ Error descargando {url}: {e}")
                 continue
 
-        # Leer archivo
         try:
             with gzip.open(file_path, 'rt', encoding='utf-8') as f:
                 data = [json.loads(line) for line in f]
@@ -102,9 +93,6 @@ def procesar_dia(fecha_input):
             print(f"⚠️ Error leyendo {file_path}: {e}")
             continue
 
-    # ---------------------------------------------------------
-    # SI NO HAY DATOS
-    # ---------------------------------------------------------
     if len(dfs_horas) == 0:
         print(f"⚪ Sin datos para {fecha_str}")
         return
@@ -131,12 +119,14 @@ def procesar_dia(fecha_input):
         axis=1
     )
 
-    df_filtrado = df_dia[['created_at', 'type', 'actor_login', 'actor_id',
-                          'repo_name', 'repo_id', 'branch',
-                          'tamano_push', 'action', 'n_commits']]
+    df_filtrado = df_dia[
+        ['created_at', 'type', 'actor_login', 'actor_id',
+         'repo_name', 'repo_id', 'branch', 'tamano_push',
+         'action', 'n_commits']
+    ]
 
     # ---------------------------------------------------------
-    # JSON: Información del día
+    # SALIDA: gh_dias.json (OBJETO, NO LISTA)
     # ---------------------------------------------------------
     doc_dia = {
         "fecha": fecha_str,
@@ -146,30 +136,32 @@ def procesar_dia(fecha_input):
         "tipos_eventos": sorted(df_filtrado['type'].unique().tolist())
     }
 
-    # ---------------------------------------------------------
-    # JSON: Muestra
-    # ---------------------------------------------------------
-    df_sample = df_filtrado.sample(SAMPLE_SIZE, random_state=42) \
-        if len(df_filtrado) > SAMPLE_SIZE else df_filtrado
-
-    doc_muestra = {
-        "fecha": fecha_str,
-        "dia": dia_nombre,
-        "registros_muestra": df_sample.to_dict("records")
-    }
-
-    # Guardar salidas
     with open("gh_dias.json", "w", encoding="utf-8") as f:
         json.dump(doc_dia, f, ensure_ascii=False, indent=4)
 
+    # ---------------------------------------------------------
+    # SALIDA: gh_muestras.json (LISTA DIRECTA)
+    # ---------------------------------------------------------
+
+    df_sample = df_filtrado.sample(SAMPLE_SIZE, random_state=42) \
+        if len(df_filtrado) > SAMPLE_SIZE else df_filtrado
+
+    df_sample = df_sample.copy()
+    df_sample["fecha"] = fecha_str
+    df_sample["dia"] = dia_nombre
+    df_sample["hora"] = pd.to_datetime(df_sample["created_at"], errors="coerce").dt.strftime("%H:%M:%S")
+
+    columnas = ["fecha", "dia", "hora"] + [c for c in df_sample.columns if c not in ["fecha", "dia", "hora"]]
+    df_sample = df_sample[columnas]
+
+    muestras_lista = df_sample.to_dict("records")
+
     with open("gh_muestras.json", "w", encoding="utf-8") as f:
-        json.dump(doc_muestra, f, ensure_ascii=False, indent=4)
+        json.dump(muestras_lista, f, ensure_ascii=False, indent=4)
 
     print("💾 Guardado: gh_dias.json y gh_muestras.json\n")
 
     return fecha_str
-
-
 
 # ============================================================
 # CÁLCULO DE MÉTRICAS
@@ -182,30 +174,18 @@ def procesar_metricas():
     with open("gh_muestras.json", "r", encoding="utf-8") as f:
         gh_muestras = json.load(f)
 
-    # Solo procesamos una fecha
-    info_dia = gh_dias
-    fecha = info_dia["fecha"]
-    dia_nombre = info_dia["dia"]
+    fecha = gh_dias["fecha"]
+    dia_nombre = gh_dias["dia"]
 
-    # Expandir muestra
-    registros = []
-    for fila in gh_muestras["registros_muestra"]:
-        registros.append(fila)
-
-    df = pd.DataFrame(registros)
+    df = pd.DataFrame(gh_muestras)
     df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
 
-    # Tipo más recurrente
     recurrente = df["type"].value_counts().idxmax() if len(df) else None
-
-    # Actor recurrente
     actor_recurrente = df["actor_login"].value_counts().idxmax() if len(df) else None
 
-    # Horas sin actividad
     horas_presentes = df["created_at"].dt.hour.unique().tolist()
     horas_sin = sorted(set(range(24)) - set(horas_presentes))
 
-    # Construcción del JSON final
     salida = {
         "fecha": fecha,
         "dia": dia_nombre,
@@ -214,17 +194,13 @@ def procesar_metricas():
         "actor_mas_recurrente": actor_recurrente
     }
 
-    # Guardar archivo
     with open("metrics.json", "w", encoding="utf-8") as f:
         json.dump(salida, f, ensure_ascii=False, indent=4)
 
     print("📊 metrics.json generado correctamente.\n")
 
-
-
-
 # ============================================================
-# EJECUCIÓN POR INPUT
+# EJECUCIÓN
 # ============================================================
 
 if __name__ == "__main__":
